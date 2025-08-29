@@ -217,6 +217,10 @@ class TradingSystem:
         self.hg_performance_history = []
         self.hg_success_patterns = {}
         self.hg_failure_analysis = {}
+        
+        # 🔧 Missing Variables - Added for complete initialization
+        self.last_hedge_time = None  # Track last hedge execution time
+        self.recent_volatility = 1.0  # Default volatility level
 
     def log(self, message: str, level: str = "INFO"):
         """Thread-safe logging"""
@@ -422,6 +426,147 @@ class TradingSystem:
         except Exception as e:
             self.log(f"Error getting market data: {str(e)}", "ERROR")
             return None
+
+    def analyze_volume_pattern(self, df: pd.DataFrame) -> dict:
+        """📊 วิเคราะห์รูปแบบปริมาณการซื้อขาย"""
+        try:
+            if df is None or len(df) < 5:
+                return {'pattern': 'INSUFFICIENT_DATA', 'strength': 0.0, 'trend': 'NEUTRAL'}
+            
+            # คำนวณ volume indicators
+            recent_volume = df['tick_volume'].tail(5).mean()
+            avg_volume = df['tick_volume'].mean() if len(df) > 10 else recent_volume
+            
+            # วิเคราะห์รูปแบบ volume
+            volume_trend = 'INCREASING' if recent_volume > avg_volume * 1.2 else 'DECREASING' if recent_volume < avg_volume * 0.8 else 'STABLE'
+            
+            # คำนวณความแรงของ pattern
+            strength = min(1.0, abs(recent_volume - avg_volume) / avg_volume)
+            
+            return {
+                'pattern': f'VOLUME_{volume_trend}',
+                'strength': strength,
+                'trend': volume_trend,
+                'recent_avg': recent_volume,
+                'historical_avg': avg_volume
+            }
+            
+        except Exception as e:
+            self.log(f"Error analyzing volume pattern: {str(e)}", "ERROR")
+            return {'pattern': 'ERROR', 'strength': 0.0, 'trend': 'NEUTRAL'}
+
+    def detect_sr_levels(self, df: pd.DataFrame) -> dict:
+        """🎯 ตรวจหา Support/Resistance levels"""
+        try:
+            if df is None or len(df) < 10:
+                return {'support_levels': [], 'resistance_levels': [], 'current_bias': 'NEUTRAL'}
+            
+            # หา local highs และ lows
+            highs = []
+            lows = []
+            
+            for i in range(2, len(df) - 2):
+                # Local high
+                if (df.iloc[i]['high'] > df.iloc[i-1]['high'] and 
+                    df.iloc[i]['high'] > df.iloc[i+1]['high'] and
+                    df.iloc[i]['high'] > df.iloc[i-2]['high'] and 
+                    df.iloc[i]['high'] > df.iloc[i+2]['high']):
+                    highs.append(df.iloc[i]['high'])
+                
+                # Local low
+                if (df.iloc[i]['low'] < df.iloc[i-1]['low'] and 
+                    df.iloc[i]['low'] < df.iloc[i+1]['low'] and
+                    df.iloc[i]['low'] < df.iloc[i-2]['low'] and 
+                    df.iloc[i]['low'] < df.iloc[i+2]['low']):
+                    lows.append(df.iloc[i]['low'])
+            
+            # กรอง levels ที่ใกล้เคียงกัน
+            current_price = df.iloc[-1]['close']
+            proximity_threshold = 0.5  # 0.5 points for XAUUSD
+            
+            resistance_levels = []
+            support_levels = []
+            
+            for high in highs:
+                if high > current_price and not any(abs(high - r) < proximity_threshold for r in resistance_levels):
+                    resistance_levels.append(high)
+                    
+            for low in lows:
+                if low < current_price and not any(abs(low - s) < proximity_threshold for s in support_levels):
+                    support_levels.append(low)
+            
+            # จำกัดจำนวน levels
+            resistance_levels = sorted(resistance_levels)[:3]
+            support_levels = sorted(support_levels, reverse=True)[:3]
+            
+            # กำหนด bias
+            bias = 'NEUTRAL'
+            if resistance_levels and support_levels:
+                if len(resistance_levels) > len(support_levels):
+                    bias = 'BEARISH'
+                elif len(support_levels) > len(resistance_levels):
+                    bias = 'BULLISH'
+            
+            return {
+                'support_levels': support_levels,
+                'resistance_levels': resistance_levels,
+                'current_bias': bias,
+                'current_price': current_price
+            }
+            
+        except Exception as e:
+            self.log(f"Error detecting S/R levels: {str(e)}", "ERROR")
+            return {'support_levels': [], 'resistance_levels': [], 'current_bias': 'NEUTRAL'}
+
+    def calculate_market_sentiment(self, df: pd.DataFrame) -> float:
+        """🧠 คำนวณ sentiment ของตลาด (0.0-1.0)"""
+        try:
+            if df is None or len(df) < 5:
+                return 0.5  # Neutral sentiment
+            
+            sentiment_score = 0.5  # เริ่มต้นที่ neutral
+            
+            # 1. Price momentum (30% weight)
+            recent_close = df.iloc[-1]['close']
+            previous_close = df.iloc[-5]['close'] if len(df) >= 5 else df.iloc[0]['close']
+            price_change = (recent_close - previous_close) / previous_close
+            momentum_score = 0.5 + (price_change * 10)  # Scale to 0-1
+            momentum_score = max(0.0, min(1.0, momentum_score))
+            
+            # 2. Candle patterns (25% weight)
+            green_count = df.tail(5)['is_green'].sum()
+            pattern_score = green_count / 5.0
+            
+            # 3. Volume confirmation (20% weight)
+            volume_data = self.analyze_volume_pattern(df)
+            volume_score = 0.5
+            if volume_data['trend'] == 'INCREASING':
+                volume_score = 0.7
+            elif volume_data['trend'] == 'DECREASING':
+                volume_score = 0.3
+            
+            # 4. Volatility factor (15% weight)
+            volatility = self.calculate_market_volatility(df)
+            volatility_score = min(1.0, volatility / 2.0)  # Higher volatility = more bullish potential
+            
+            # 5. Recent body strength (10% weight)
+            avg_body_ratio = df.tail(3)['body_ratio'].mean()
+            body_score = min(1.0, avg_body_ratio / 10.0)  # Strong bodies = more directional
+            
+            # Weighted combination
+            sentiment_score = (
+                momentum_score * 0.30 +
+                pattern_score * 0.25 +
+                volume_score * 0.20 +
+                volatility_score * 0.15 +
+                body_score * 0.10
+            )
+            
+            return max(0.0, min(1.0, sentiment_score))
+            
+        except Exception as e:
+            self.log(f"Error calculating market sentiment: {str(e)}", "ERROR")
+            return 0.5  # Return neutral on error
 
     def analyze_real_time_sentiment(self) -> dict:
         """วิเคราะห์ sentiment แบบ real-time"""
@@ -4470,58 +4615,63 @@ class TradingGUI:
 
     def update_positions_display(self):
         """Update positions in the treeview"""
-        # Clear existing items
-        for item in self.positions_tree.get_children():
-            self.positions_tree.delete(item)
-        
-        # Add current positions
-        for pos in self.trading_system.positions:
-            values = (
-                pos.ticket,
-                pos.type,
-                f"{pos.volume:.2f}",
-                f"{pos.open_price:.2f}",
-                f"{pos.current_price:.2f}",
-                f"${pos.profit:.2f}",
-                f"${pos.profit_per_lot:.2f}",
-                pos.role,
-                pos.efficiency
-            )
+        try:
+            # Clear existing items
+            for item in self.positions_tree.get_children():
+                self.positions_tree.delete(item)
             
-            # Color coding based on efficiency
-            if pos.efficiency == "excellent":
-                tag = "excellent"
-            elif pos.efficiency == "good":
-                tag = "good"
-            elif pos.efficiency == "fair":
-                tag = "fair"
-            else:
-                tag = "poor"
+            # Add current positions
+            for pos in self.trading_system.positions:
+                values = (
+                    pos.ticket,
+                    pos.type,
+                    f"{pos.volume:.2f}",
+                    f"{pos.open_price:.2f}",
+                    f"{pos.current_price:.2f}",
+                    f"${pos.profit:.2f}",
+                    f"${pos.profit_per_lot:.2f}",
+                    pos.role,
+                    pos.efficiency
+                )
+                
+                # Color coding based on efficiency
+                if pos.efficiency == "excellent":
+                    tag = "excellent"
+                elif pos.efficiency == "good":
+                    tag = "good"
+                elif pos.efficiency == "fair":
+                    tag = "fair"
+                else:
+                    tag = "poor"
+                
+                self.positions_tree.insert('', 'end', values=values, tags=(tag,))
             
-            self.positions_tree.insert('', 'end', values=values, tags=(tag,))
-        
-        # Configure tags for color coding
-        self.positions_tree.tag_configure("excellent", background="#004400")
-        self.positions_tree.tag_configure("good", background="#003300")
-        self.positions_tree.tag_configure("fair", background="#333300")
-        self.positions_tree.tag_configure("poor", background="#440000")
+            # Configure tags for color coding
+            self.positions_tree.tag_configure("excellent", background="#004400")
+            self.positions_tree.tag_configure("good", background="#003300")
+            self.positions_tree.tag_configure("fair", background="#333300")
+            self.positions_tree.tag_configure("poor", background="#440000")
+            
+        except Exception as e:
+            print(f"Error updating positions display: {str(e)}")
 
     def update_analytics_display(self):
         """Update analytics with smart router information"""
-        # Update statistics
-        self.stats_text.delete(1.0, tk.END)
-        
-        smart_stats = self.trading_system.get_smart_management_stats()
-        current_time = datetime.now().strftime("%H:%M:%S")
-        
-        # เพิ่มข้อมูล debug
-        market_status = "Active" if self.trading_system.trading_active else "Stopped"
-        last_signal = "Never"
-        if self.trading_system.last_signal_time:
-            seconds_ago = (datetime.now() - self.trading_system.last_signal_time).seconds
-            last_signal = f"{seconds_ago}s ago"
-        
-        stats = f"""
+        try:
+            # Update statistics
+            self.stats_text.delete(1.0, tk.END)
+            
+            smart_stats = self.trading_system.get_smart_management_stats()
+            current_time = datetime.now().strftime("%H:%M:%S")
+            
+            # เพิ่มข้อมูล debug
+            market_status = "Active" if self.trading_system.trading_active else "Stopped"
+            last_signal = "Never"
+            if self.trading_system.last_signal_time:
+                seconds_ago = (datetime.now() - self.trading_system.last_signal_time).seconds
+                last_signal = f"{seconds_ago}s ago"
+            
+            stats = f"""
 ⏰ REAL-TIME STATUS [{current_time}]:
 Market Status: {market_status}
 Last Signal: {last_signal}
@@ -4543,28 +4693,31 @@ Redirect Ratio: {smart_stats.get('redirect_ratio', 0):.1f}%
 Active Positions: {len(self.trading_system.positions)}/{self.trading_system.max_positions}
 Balance Ratio: {(self.trading_system.buy_volume/(self.trading_system.buy_volume+self.trading_system.sell_volume)*100) if (self.trading_system.buy_volume+self.trading_system.sell_volume) > 0 else 50:.1f}% BUY
 Health Score: {self.trading_system.portfolio_health:.1f}%
-        """
-        
-        self.stats_text.insert(tk.END, stats)
-        
-        # Update recommendations
-        self.recommendations_text.delete(1.0, tk.END)
-        recommendations = self.get_smart_router_recommendations(smart_stats)
-        
-        if recommendations:
-            rec_text = "🧠 SMART ROUTER INSIGHTS:\n\n"
-            for i, rec in enumerate(recommendations, 1):
-                rec_text += f"{i}. {rec}\n"
-        else:
-            rec_text = f"🧠 SYSTEM STATUS [{current_time}]:\n\n"
-            if self.trading_system.trading_active:
-                rec_text += "✅ System running and monitoring market\n"
-                rec_text += "⏳ Waiting for signal conditions...\n"
-                rec_text += "📊 Analyzing M5 XAUUSD candles\n"
+            """
+            
+            self.stats_text.insert(tk.END, stats)
+            
+            # Update recommendations
+            self.recommendations_text.delete(1.0, tk.END)
+            recommendations = self.get_smart_router_recommendations(smart_stats)
+            
+            if recommendations:
+                rec_text = "🧠 SMART ROUTER INSIGHTS:\n\n"
+                for i, rec in enumerate(recommendations, 1):
+                    rec_text += f"{i}. {rec}\n"
             else:
-                rec_text += "⏹️ Trading system stopped\n"
-        
-        self.recommendations_text.insert(tk.END, rec_text)
+                rec_text = f"🧠 SYSTEM STATUS [{current_time}]:\n\n"
+                if self.trading_system.trading_active:
+                    rec_text += "✅ System running and monitoring market\n"
+                    rec_text += "⏳ Waiting for signal conditions...\n"
+                    rec_text += "📊 Analyzing M5 XAUUSD candles\n"
+                else:
+                    rec_text += "⏹️ Trading system stopped\n"
+            
+            self.recommendations_text.insert(tk.END, rec_text)
+            
+        except Exception as e:
+            print(f"Error updating analytics display: {str(e)}")
 
     def get_smart_router_recommendations(self, smart_stats: dict) -> List[str]:
         """Generate smart router recommendations"""
@@ -4618,8 +4771,11 @@ Health Score: {self.trading_system.portfolio_health:.1f}%
 
     def update_status_labels(self):
         """Update status labels"""
-        self.portfolio_label.config(text=f"💼 Portfolio Health: {self.trading_system.portfolio_health:.1f}%")
-        self.volume_label.config(text=f"⚖️ Volume Balance: {self.trading_system.buy_volume:.2f}/{self.trading_system.sell_volume:.2f}")
+        try:
+            self.portfolio_label.config(text=f"💼 Portfolio Health: {self.trading_system.portfolio_health:.1f}%")
+            self.volume_label.config(text=f"⚖️ Volume Balance: {self.trading_system.buy_volume:.2f}/{self.trading_system.sell_volume:.2f}")
+        except Exception as e:
+            print(f"Error updating status labels: {str(e)}")
 
     def update_log_display(self):
         """Update log display with new messages"""
