@@ -43,6 +43,20 @@ class Position:
     role: str  # MAIN, HG, SUPPORT, SACRIFICE
     efficiency: str  # excellent, good, fair, poor
 
+@dataclass
+class MT5Account:
+    """MT5 Account data structure"""
+    login: int
+    server: str
+    name: str
+    balance: float = 0.0
+    equity: float = 0.0
+    margin: float = 0.0
+    margin_level: float = 0.0
+    connected: bool = False
+    last_update: datetime = None
+    connection_path: str = ""  # MT5 terminal path if different
+
 class OrderRole(Enum):
     MAIN = "MAIN"
     HEDGE_GUARD = "HG"
@@ -51,7 +65,14 @@ class OrderRole(Enum):
 
 class TradingSystem:
     def __init__(self):
-        self.mt5_connected = False
+        # Multi-account support
+        self.mt5_accounts: Dict[int, MT5Account] = {}  # login -> account info
+        self.connected_accounts: Dict[int, bool] = {}  # login -> connection status
+        self.active_account: Optional[int] = None  # currently selected account login
+        
+        # Legacy compatibility
+        self.mt5_connected = False  # True if any account is connected
+        
         self.trading_active = False
         self.symbol = "XAUUSD.v"  # เปลี่ยนจาก "XAUUSD" เป็น "XAUUSD.v"
         self.base_lot = 0.01
@@ -68,8 +89,9 @@ class TradingSystem:
         self.last_signal_time = None
         self.hourly_signals = []
         
-        # Portfolio tracking
-        self.positions: List[Position] = []
+        # Portfolio tracking - now account-specific
+        self.positions: Dict[int, List[Position]] = {}  # account_login -> positions
+        self.account_positions: List[Position] = []  # positions for active account
         self.buy_volume = 0.0
         self.sell_volume = 0.0
         self.portfolio_health = 100.0
@@ -269,8 +291,184 @@ class TradingSystem:
             self.log(f"Error detecting filling type: {str(e)}", "ERROR")
             return mt5.ORDER_FILLING_IOC
 
+    def add_account(self, login: int, server: str, name: str = "", connection_path: str = "") -> bool:
+        """Add MT5 account to the system"""
+        try:
+            account = MT5Account(
+                login=login,
+                server=server,
+                name=name or f"Account {login}",
+                connection_path=connection_path
+            )
+            self.mt5_accounts[login] = account
+            self.connected_accounts[login] = False
+            self.positions[login] = []
+            
+            self.log(f"Added account {login} ({server})")
+            return True
+        except Exception as e:
+            self.log(f"Error adding account {login}: {str(e)}", "ERROR")
+            return False
+
+    def remove_account(self, login: int) -> bool:
+        """Remove MT5 account from the system"""
+        try:
+            if login in self.connected_accounts and self.connected_accounts[login]:
+                self.disconnect_account(login)
+            
+            if login in self.mt5_accounts:
+                del self.mt5_accounts[login]
+            if login in self.connected_accounts:
+                del self.connected_accounts[login]
+            if login in self.positions:
+                del self.positions[login]
+            
+            # Update active account if removed
+            if self.active_account == login:
+                self.active_account = None
+                if self.connected_accounts:
+                    # Set first connected account as active
+                    for acc_login, connected in self.connected_accounts.items():
+                        if connected:
+                            self.active_account = acc_login
+                            break
+            
+            self.log(f"Removed account {login}")
+            return True
+        except Exception as e:
+            self.log(f"Error removing account {login}: {str(e)}", "ERROR")
+            return False
+
+    def connect_account(self, login: int, password: str = "", server: str = "") -> bool:
+        """Connect to specific MT5 account"""
+        try:
+            if login not in self.mt5_accounts:
+                self.log(f"Account {login} not found in system", "ERROR")
+                return False
+            
+            account = self.mt5_accounts[login]
+            
+            # Initialize MT5 if not already done
+            if not any(self.connected_accounts.values()):
+                if not mt5.initialize(path=account.connection_path if account.connection_path else None):
+                    self.log("MT5 initialization failed", "ERROR")
+                    return False
+            
+            # Login to account if credentials provided
+            if password and server:
+                if not mt5.login(login, password, server):
+                    self.log(f"Failed to login to account {login}", "ERROR")
+                    return False
+            elif password:
+                if not mt5.login(login, password, account.server):
+                    self.log(f"Failed to login to account {login}", "ERROR")
+                    return False
+            
+            # Get account info
+            account_info = mt5.account_info()
+            if account_info is None:
+                self.log(f"Failed to get info for account {login}", "ERROR")
+                return False
+            
+            # Update account data
+            account.balance = account_info.balance
+            account.equity = account_info.equity
+            account.margin = account_info.margin
+            account.margin_level = account_info.margin_level if account_info.margin > 0 else 0
+            account.connected = True
+            account.last_update = datetime.now()
+            
+            self.connected_accounts[login] = True
+            
+            # Set as active if no active account
+            if self.active_account is None:
+                self.active_account = login
+                self.update_active_account_data()
+            
+            # Update legacy connection status
+            self.mt5_connected = any(self.connected_accounts.values())
+            
+            # Auto-detect filling type
+            if self.active_account == login:
+                self.filling_type = self.detect_broker_filling_type()
+            
+            self.log(f"Connected to account {login} - Balance: ${account.balance:.2f}, Equity: ${account.equity:.2f}")
+            return True
+            
+        except Exception as e:
+            self.log(f"Error connecting to account {login}: {str(e)}", "ERROR")
+            return False
+
+    def disconnect_account(self, login: int) -> bool:
+        """Disconnect specific MT5 account"""
+        try:
+            if login not in self.connected_accounts:
+                return True
+            
+            if login in self.mt5_accounts:
+                self.mt5_accounts[login].connected = False
+            
+            self.connected_accounts[login] = False
+            
+            # Update active account if disconnected
+            if self.active_account == login:
+                self.active_account = None
+                # Set first connected account as active
+                for acc_login, connected in self.connected_accounts.items():
+                    if connected:
+                        self.active_account = acc_login
+                        self.update_active_account_data()
+                        break
+            
+            # Update legacy connection status
+            self.mt5_connected = any(self.connected_accounts.values())
+            
+            # Shutdown MT5 if no accounts connected
+            if not self.mt5_connected:
+                mt5.shutdown()
+            
+            self.log(f"Disconnected from account {login}")
+            return True
+            
+        except Exception as e:
+            self.log(f"Error disconnecting account {login}: {str(e)}", "ERROR")
+            return False
+
+    def set_active_account(self, login: int) -> bool:
+        """Set active account for trading operations"""
+        try:
+            if login not in self.connected_accounts or not self.connected_accounts[login]:
+                self.log(f"Account {login} is not connected", "ERROR")
+                return False
+            
+            self.active_account = login
+            self.update_active_account_data()
+            self.log(f"Active account set to {login}")
+            return True
+            
+        except Exception as e:
+            self.log(f"Error setting active account {login}: {str(e)}", "ERROR")
+            return False
+
+    def update_active_account_data(self):
+        """Update data for currently active account"""
+        if self.active_account and self.active_account in self.positions:
+            self.account_positions = self.positions[self.active_account]
+        else:
+            self.account_positions = []
+
+    def get_connected_accounts(self) -> List[MT5Account]:
+        """Get list of connected accounts"""
+        return [acc for login, acc in self.mt5_accounts.items() 
+                if self.connected_accounts.get(login, False)]
+
+    def get_active_account_info(self) -> Optional[MT5Account]:
+        """Get active account information"""
+        if self.active_account and self.active_account in self.mt5_accounts:
+            return self.mt5_accounts[self.active_account]
+        return None
     def connect_mt5(self) -> bool:
-        """Connect to MetaTrader 5"""
+        """Legacy method: Connect to MetaTrader 5 (backward compatibility)"""
         try:
             if not mt5.initialize():
                 self.log("MT5 initialization failed", "ERROR")
@@ -282,6 +480,22 @@ class TradingSystem:
                 self.log("Failed to get account info", "ERROR")
                 return False
             
+            # Add account if not exists
+            login = account_info.login
+            if login not in self.mt5_accounts:
+                self.add_account(login, account_info.server, f"Account {login}")
+            
+            # Update account data
+            account = self.mt5_accounts[login]
+            account.balance = account_info.balance
+            account.equity = account_info.equity
+            account.margin = account_info.margin
+            account.margin_level = account_info.margin_level if account_info.margin > 0 else 0
+            account.connected = True
+            account.last_update = datetime.now()
+            
+            self.connected_accounts[login] = True
+            self.active_account = login
             self.mt5_connected = True
             
             # Auto-detect filling type after connection
@@ -296,7 +510,7 @@ class TradingSystem:
             return False
 
     def disconnect_mt5(self):
-        """Disconnect from MetaTrader 5 and save state"""
+        """Legacy method: Disconnect from MetaTrader 5 and save state"""
         if self.trading_active:
             self.trading_active = False
             time.sleep(2)  # รอให้ loop หยุด
@@ -304,9 +518,15 @@ class TradingSystem:
         if self.mt5_connected:
             # Save state ก่อนปิด
             self.save_trading_state()
+            
+            # Disconnect all accounts
+            for login in list(self.connected_accounts.keys()):
+                self.disconnect_account(login)
+            
             mt5.shutdown()
             self.mt5_connected = False
-            self.log("💾 State saved and disconnected from MT5")
+            self.active_account = None
+            self.log("💾 State saved and disconnected from all MT5 accounts")
 
     def optimize_trading_parameters(self):
         """ปรับพารามิเตอร์แบบ adaptive"""
@@ -1262,8 +1482,8 @@ class TradingSystem:
             return False
 
     def update_positions(self):
-        """Update position data and calculate metrics"""
-        if not self.mt5_connected:
+        """Update position data and calculate metrics for active account"""
+        if not self.mt5_connected or not self.active_account:
             return
             
         try:
@@ -1271,7 +1491,12 @@ class TradingSystem:
             if positions is None:
                 positions = []
             
-            self.positions.clear()
+            # Clear positions for active account
+            if self.active_account not in self.positions:
+                self.positions[self.active_account] = []
+            else:
+                self.positions[self.active_account].clear()
+            
             self.buy_volume = 0.0
             self.sell_volume = 0.0
             
@@ -1305,13 +1530,16 @@ class TradingSystem:
                     efficiency=efficiency
                 )
                 
-                self.positions.append(position)
+                self.positions[self.active_account].append(position)
                 
                 # Update volume counters
                 if pos.type == 0:  # BUY
                     self.buy_volume += pos.volume
                 else:  # SELL
                     self.sell_volume += pos.volume
+            
+            # Update account positions reference
+            self.update_active_account_data()
             
             # Calculate portfolio health
             self.calculate_portfolio_health()
@@ -1332,13 +1560,13 @@ class TradingSystem:
 
     def calculate_portfolio_health(self):
         """Calculate overall portfolio health score"""
-        if not self.positions:
+        if not self.account_positions:
             self.portfolio_health = 100.0
             return
             
         try:
-            total_profit = sum(pos.profit for pos in self.positions)
-            total_volume = sum(pos.volume for pos in self.positions)
+            total_profit = sum(pos.profit for pos in self.account_positions)
+            total_volume = sum(pos.volume for pos in self.account_positions)
             
             # Volume balance factor
             total_vol = self.buy_volume + self.sell_volume
@@ -1349,15 +1577,15 @@ class TradingSystem:
                 balance_factor = 1.0 - (imbalance * 0.5)  # Max 25% penalty
             
             # Efficiency distribution
-            excellent_count = len([p for p in self.positions if p.efficiency == "excellent"])
-            good_count = len([p for p in self.positions if p.efficiency == "good"])
-            poor_count = len([p for p in self.positions if p.efficiency == "poor"])
+            excellent_count = len([p for p in self.account_positions if p.efficiency == "excellent"])
+            good_count = len([p for p in self.account_positions if p.efficiency == "good"])
+            poor_count = len([p for p in self.account_positions if p.efficiency == "poor"])
             
-            efficiency_score = (excellent_count * 100 + good_count * 70 - poor_count * 30) / len(self.positions)
+            efficiency_score = (excellent_count * 100 + good_count * 70 - poor_count * 30) / len(self.account_positions)
             efficiency_score = max(0, min(100, efficiency_score))
             
             # Position count factor
-            position_factor = max(0.5, 1.0 - (len(self.positions) / self.max_positions) * 0.3)
+            position_factor = max(0.5, 1.0 - (len(self.account_positions) / self.max_positions) * 0.3)
             
             # Calculate final health score
             self.portfolio_health = efficiency_score * balance_factor * position_factor
@@ -1372,14 +1600,14 @@ class TradingSystem:
         recommendations = []
         
         try:
-            if not self.positions:
+            if not self.account_positions:
                 return recommendations
             
             # Find sacrifice candidates
-            sacrifice_positions = [p for p in self.positions if p.role == OrderRole.SACRIFICE.value]
+            sacrifice_positions = [p for p in self.account_positions if p.role == OrderRole.SACRIFICE.value]
             if sacrifice_positions:
                 total_sacrifice_loss = sum(p.profit for p in sacrifice_positions)
-                main_positions = [p for p in self.positions if p.role == OrderRole.MAIN.value]
+                main_positions = [p for p in self.account_positions if p.role == OrderRole.MAIN.value]
                 total_main_profit = sum(p.profit for p in main_positions)
                 
                 if total_main_profit > abs(total_sacrifice_loss) * 1.2:
@@ -1399,7 +1627,7 @@ class TradingSystem:
             if account_info and account_info.margin > 0:
                 margin_level = (account_info.equity / account_info.margin) * 100
                 if margin_level < 300:
-                    poor_positions = [p for p in self.positions if p.efficiency == "poor"]
+                    poor_positions = [p for p in self.account_positions if p.efficiency == "poor"]
                     if poor_positions:
                         recommendations.append(f"Low margin warning - consider closing {len(poor_positions)} poor positions")
             
@@ -3188,10 +3416,31 @@ class TradingSystem:
     def save_trading_state(self):
         """💾 บันทึกสถานะสำคัญของระบบ"""
         try:
+            # Serialize MT5Account objects to dictionaries
+            serialized_accounts = {}
+            for login, account in self.mt5_accounts.items():
+                serialized_accounts[login] = {
+                    "login": account.login,
+                    "server": account.server,
+                    "name": account.name,
+                    "balance": account.balance,
+                    "equity": account.equity,
+                    "margin": account.margin,
+                    "margin_level": account.margin_level,
+                    "connected": account.connected,
+                    "last_update": account.last_update.isoformat() if account.last_update else None,
+                    "connection_path": account.connection_path
+                }
+            
             # ข้อมูลที่จะบันทึก
             state_data = {
                 "timestamp": datetime.now().isoformat(),
-                "version": "3.0",
+                "version": "3.1",  # Updated version for multi-account support
+                
+                # Multi-account data
+                "mt5_accounts": serialized_accounts,
+                "connected_accounts": self.connected_accounts,
+                "active_account": self.active_account,
                 
                 # Position tracking
                 "position_tracker": self.position_tracker,
@@ -3253,8 +3502,39 @@ class TradingSystem:
                 state_data = json.load(f)
             
             # ตรวจสอบ version
-            if state_data.get("version") != "3.0":
-                self.log("⚠️ Different version detected, loading basic data only", "WARNING")
+            version = state_data.get("version", "3.0")
+            if version not in ["3.0", "3.1"]:
+                self.log("⚠️ Unknown version detected, loading basic data only", "WARNING")
+            
+            # Load multi-account data (version 3.1+)
+            if version == "3.1" and "mt5_accounts" in state_data:
+                self.mt5_accounts.clear()
+                self.connected_accounts.clear()
+                self.positions.clear()
+                
+                # Restore MT5 accounts
+                for login_str, account_data in state_data["mt5_accounts"].items():
+                    login = int(login_str)
+                    account = MT5Account(
+                        login=account_data["login"],
+                        server=account_data["server"],
+                        name=account_data["name"],
+                        balance=account_data.get("balance", 0.0),
+                        equity=account_data.get("equity", 0.0),
+                        margin=account_data.get("margin", 0.0),
+                        margin_level=account_data.get("margin_level", 0.0),
+                        connected=False,  # Don't auto-connect on load
+                        last_update=datetime.fromisoformat(account_data["last_update"]) if account_data.get("last_update") else None,
+                        connection_path=account_data.get("connection_path", "")
+                    )
+                    self.mt5_accounts[login] = account
+                    self.connected_accounts[login] = False  # Reset connection status
+                    self.positions[login] = []
+                
+                # Restore active account (but don't set if not connected)
+                saved_active = state_data.get("active_account")
+                if saved_active and saved_active in self.mt5_accounts:
+                    self.log(f"📝 Previous active account was {saved_active} (not auto-connected)")
             
             # Restore data
             self.position_tracker = state_data.get("position_tracker", {})
@@ -3304,6 +3584,9 @@ class TradingSystem:
             
             saved_time = state_data.get("timestamp", "Unknown")
             self.log(f"✅ Trading state loaded from {saved_time}")
+            
+            if version == "3.1":
+                self.log(f"📊 Restored: {len(self.mt5_accounts)} MT5 accounts")
             self.log(f"📊 Restored: {len(self.position_tracker)} position trackers")
             self.log(f"📊 Restored: {len(self.active_hedges)} hedge groups")
             self.log(f"📊 Stats: {self.total_signals} signals, {self.total_redirects} redirects")
@@ -4483,15 +4766,57 @@ class TradingGUI:
                                      bg='#3b3b3b', fg='white', font=('Arial', 10, 'bold'))
         control_frame.pack(fill='x', padx=10, pady=5)
         
-        # Connection buttons
+        # Multi-Account Management Frame
+        account_frame = tk.LabelFrame(control_frame, text="📊 MT5 Accounts", 
+                                     bg='#3b3b3b', fg='white', font=('Arial', 9, 'bold'))
+        account_frame.pack(side='left', padx=10, pady=5, fill='y')
+        
+        # Account management buttons
+        acc_btn_frame = tk.Frame(account_frame, bg='#3b3b3b')
+        acc_btn_frame.pack(fill='x', padx=5, pady=2)
+        
+        self.add_account_btn = ttk.Button(acc_btn_frame, text="➕ Add Account", 
+                                         command=self.show_add_account_dialog, style='Custom.TButton')
+        self.add_account_btn.pack(side='left', padx=2)
+        
+        self.connect_selected_btn = ttk.Button(acc_btn_frame, text="🔌 Connect Selected", 
+                                              command=self.connect_selected_accounts, style='Custom.TButton')
+        self.connect_selected_btn.pack(side='left', padx=2)
+        
+        # Account list with checkboxes
+        list_frame = tk.Frame(account_frame, bg='#3b3b3b')
+        list_frame.pack(fill='both', expand=True, padx=5, pady=2)
+        
+        # Scrollable listbox for accounts
+        self.account_listbox = tk.Listbox(list_frame, height=4, bg='#2b2b2b', fg='white',
+                                         selectmode=tk.MULTIPLE, font=('Arial', 8))
+        account_scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
+        self.account_listbox.configure(yscrollcommand=account_scrollbar.set)
+        account_scrollbar.configure(command=self.account_listbox.yview)
+        
+        self.account_listbox.pack(side='left', fill='both', expand=True)
+        account_scrollbar.pack(side='right', fill='y')
+        
+        # Active account selection
+        active_frame = tk.Frame(account_frame, bg='#3b3b3b')
+        active_frame.pack(fill='x', padx=5, pady=2)
+        
+        tk.Label(active_frame, text="Active:", bg='#3b3b3b', fg='white', font=('Arial', 8)).pack(side='left')
+        self.active_account_var = tk.StringVar()
+        self.active_account_combo = ttk.Combobox(active_frame, textvariable=self.active_account_var,
+                                                state="readonly", width=15, font=('Arial', 8))
+        self.active_account_combo.pack(side='left', padx=5)
+        self.active_account_combo.bind('<<ComboboxSelected>>', self.on_active_account_changed)
+        
+        # Legacy connection buttons (for backward compatibility)
         conn_frame = tk.Frame(control_frame, bg='#3b3b3b')
         conn_frame.pack(side='left', padx=10, pady=10)
         
-        self.connect_btn = ttk.Button(conn_frame, text="🔌 Connect MT5", 
+        self.connect_btn = ttk.Button(conn_frame, text="🔌 Quick Connect", 
                                      command=self.connect_mt5, style='Custom.TButton')
         self.connect_btn.pack(side='left', padx=5)
         
-        self.disconnect_btn = ttk.Button(conn_frame, text="🔌 Disconnect", 
+        self.disconnect_btn = ttk.Button(conn_frame, text="🔌 Disconnect All", 
                                         command=self.disconnect_mt5, style='Custom.TButton')
         self.disconnect_btn.pack(side='left', padx=5)
         
@@ -4518,6 +4843,10 @@ class TradingGUI:
         self.volume_label = ttk.Label(info_frame, text="⚖️ Volume Balance: 0.00/0.00", 
                                      style='Status.TLabel')
         self.volume_label.pack(side='top')
+        
+        self.account_info_label = ttk.Label(info_frame, text="📊 No Active Account", 
+                                           style='Status.TLabel')
+        self.account_info_label.pack(side='top')
 
     def create_positions_frame(self):
         """Create positions monitoring frame"""
@@ -4576,19 +4905,241 @@ class TradingGUI:
                                                  font=('Consolas', 9))
         self.log_text.pack(fill='both', expand=True, padx=5, pady=5)
 
+    def show_add_account_dialog(self):
+        """Show dialog to add new MT5 account"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add MT5 Account")
+        dialog.geometry("400x300")
+        dialog.configure(bg='#2b2b2b')
+        dialog.resizable(False, False)
+        
+        # Center dialog
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Form fields
+        tk.Label(dialog, text="Add New MT5 Account", bg='#2b2b2b', fg='white', 
+                font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        form_frame = tk.Frame(dialog, bg='#2b2b2b')
+        form_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        # Login
+        tk.Label(form_frame, text="Login:", bg='#2b2b2b', fg='white').grid(row=0, column=0, sticky='w', pady=5)
+        login_entry = tk.Entry(form_frame, width=20)
+        login_entry.grid(row=0, column=1, padx=10, pady=5, sticky='ew')
+        
+        # Password
+        tk.Label(form_frame, text="Password:", bg='#2b2b2b', fg='white').grid(row=1, column=0, sticky='w', pady=5)
+        password_entry = tk.Entry(form_frame, width=20, show='*')
+        password_entry.grid(row=1, column=1, padx=10, pady=5, sticky='ew')
+        
+        # Server
+        tk.Label(form_frame, text="Server:", bg='#2b2b2b', fg='white').grid(row=2, column=0, sticky='w', pady=5)
+        server_entry = tk.Entry(form_frame, width=20)
+        server_entry.grid(row=2, column=1, padx=10, pady=5, sticky='ew')
+        
+        # Name (optional)
+        tk.Label(form_frame, text="Name (optional):", bg='#2b2b2b', fg='white').grid(row=3, column=0, sticky='w', pady=5)
+        name_entry = tk.Entry(form_frame, width=20)
+        name_entry.grid(row=3, column=1, padx=10, pady=5, sticky='ew')
+        
+        # Terminal Path (optional)
+        tk.Label(form_frame, text="Terminal Path (optional):", bg='#2b2b2b', fg='white').grid(row=4, column=0, sticky='w', pady=5)
+        path_entry = tk.Entry(form_frame, width=20)
+        path_entry.grid(row=4, column=1, padx=10, pady=5, sticky='ew')
+        
+        form_frame.columnconfigure(1, weight=1)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg='#2b2b2b')
+        btn_frame.pack(fill='x', padx=20, pady=10)
+        
+        def add_account():
+            try:
+                login = int(login_entry.get().strip())
+                password = password_entry.get().strip()
+                server = server_entry.get().strip()
+                name = name_entry.get().strip()
+                path = path_entry.get().strip()
+                
+                if not login or not password or not server:
+                    messagebox.showerror("Error", "Login, Password, and Server are required")
+                    return
+                
+                # Add account to system
+                if self.trading_system.add_account(login, server, name, path):
+                    # Try to connect
+                    if self.trading_system.connect_account(login, password, server):
+                        self.update_account_display()
+                        messagebox.showinfo("Success", f"Account {login} added and connected successfully")
+                        dialog.destroy()
+                    else:
+                        messagebox.showwarning("Warning", f"Account {login} added but connection failed")
+                        self.update_account_display()
+                        dialog.destroy()
+                else:
+                    messagebox.showerror("Error", "Failed to add account")
+                    
+            except ValueError:
+                messagebox.showerror("Error", "Login must be a number")
+            except Exception as e:
+                messagebox.showerror("Error", f"Error adding account: {str(e)}")
+        
+        def cancel():
+            dialog.destroy()
+        
+        ttk.Button(btn_frame, text="Add & Connect", command=add_account).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=cancel).pack(side='left', padx=5)
+        
+        # Focus on login entry
+        login_entry.focus()
+
+    def connect_selected_accounts(self):
+        """Connect to selected accounts"""
+        selected_indices = self.account_listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning("Warning", "Please select accounts to connect")
+            return
+        
+        connected_count = 0
+        failed_accounts = []
+        
+        for index in selected_indices:
+            account_text = self.account_listbox.get(index)
+            # Extract login from account text (format: "Login (Server) - Status")
+            try:
+                login = int(account_text.split(' ')[0])
+                if login in self.trading_system.mt5_accounts:
+                    # For reconnection, we need password - show dialog
+                    password = self.prompt_password(login)
+                    if password:
+                        if self.trading_system.connect_account(login, password):
+                            connected_count += 1
+                        else:
+                            failed_accounts.append(str(login))
+            except (ValueError, IndexError):
+                continue
+        
+        self.update_account_display()
+        
+        if connected_count > 0:
+            message = f"Connected to {connected_count} account(s)"
+            if failed_accounts:
+                message += f". Failed: {', '.join(failed_accounts)}"
+            messagebox.showinfo("Connection Results", message)
+        else:
+            messagebox.showerror("Error", "Failed to connect to any selected accounts")
+
+    def prompt_password(self, login: int) -> str:
+        """Prompt for account password"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Password for Account {login}")
+        dialog.geometry("300x150")
+        dialog.configure(bg='#2b2b2b')
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        result = {'password': None}
+        
+        tk.Label(dialog, text=f"Enter password for account {login}:", 
+                bg='#2b2b2b', fg='white').pack(pady=10)
+        
+        password_entry = tk.Entry(dialog, show='*', width=30)
+        password_entry.pack(pady=10)
+        
+        btn_frame = tk.Frame(dialog, bg='#2b2b2b')
+        btn_frame.pack(pady=10)
+        
+        def ok():
+            result['password'] = password_entry.get()
+            dialog.destroy()
+        
+        def cancel():
+            dialog.destroy()
+        
+        ttk.Button(btn_frame, text="OK", command=ok).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=cancel).pack(side='left', padx=5)
+        
+        password_entry.focus()
+        password_entry.bind('<Return>', lambda e: ok())
+        
+        dialog.wait_window()
+        return result['password']
+
+    def on_active_account_changed(self, event=None):
+        """Handle active account selection change"""
+        selected = self.active_account_var.get()
+        if selected:
+            try:
+                login = int(selected.split(' ')[0])
+                if self.trading_system.set_active_account(login):
+                    self.update_account_info_display()
+            except (ValueError, IndexError):
+                pass
+
+    def update_account_display(self):
+        """Update account list and status"""
+        # Update account listbox
+        self.account_listbox.delete(0, tk.END)
+        
+        for login, account in self.trading_system.mt5_accounts.items():
+            connected = self.trading_system.connected_accounts.get(login, False)
+            status = "🟢 Connected" if connected else "🔴 Disconnected"
+            account_text = f"{login} ({account.server}) - {status}"
+            self.account_listbox.insert(tk.END, account_text)
+        
+        # Update active account combobox
+        connected_accounts = []
+        for login, account in self.trading_system.mt5_accounts.items():
+            if self.trading_system.connected_accounts.get(login, False):
+                connected_accounts.append(f"{login} ({account.name})")
+        
+        self.active_account_combo['values'] = connected_accounts
+        
+        # Set current active account
+        if (self.trading_system.active_account and 
+            self.trading_system.active_account in self.trading_system.mt5_accounts):
+            active_account = self.trading_system.mt5_accounts[self.trading_system.active_account]
+            self.active_account_var.set(f"{self.trading_system.active_account} ({active_account.name})")
+        else:
+            self.active_account_var.set("")
+        
+        # Update connection status
+        connected_count = sum(self.trading_system.connected_accounts.values())
+        if connected_count > 0:
+            self.connection_status.config(
+                text=f"✅ Connected ({connected_count} accounts)", 
+                foreground='#00ff00'
+            )
+        else:
+            self.connection_status.config(text="❌ Disconnected", foreground='#ff0000')
+
+    def update_account_info_display(self):
+        """Update account information display"""
+        active_account = self.trading_system.get_active_account_info()
+        if active_account:
+            info_text = f"📊 {active_account.name}: ${active_account.balance:.2f} / ${active_account.equity:.2f}"
+            self.account_info_label.config(text=info_text)
+        else:
+            self.account_info_label.config(text="📊 No Active Account")
+
     def connect_mt5(self):
-        """Connect to MT5"""
+        """Legacy connect to MT5 (Quick Connect)"""
         if self.trading_system.connect_mt5():
-            self.connection_status.config(text="✅ Connected", foreground='#00ff00')
+            self.update_account_display()
+            self.update_account_info_display()
             messagebox.showinfo("Success", "Connected to MetaTrader 5")
         else:
             messagebox.showerror("Error", "Failed to connect to MetaTrader 5")
 
     def disconnect_mt5(self):
-        """Disconnect from MT5"""
+        """Disconnect from all MT5 accounts"""
         self.stop_trading()
         self.trading_system.disconnect_mt5()
-        self.connection_status.config(text="❌ Disconnected", foreground='#ff0000')
+        self.update_account_display()
+        self.update_account_info_display()
 
     def start_trading(self):
         """Start automated trading"""
@@ -4620,8 +5171,8 @@ class TradingGUI:
             for item in self.positions_tree.get_children():
                 self.positions_tree.delete(item)
             
-            # Add current positions
-            for pos in self.trading_system.positions:
+            # Add current positions for active account
+            for pos in self.trading_system.account_positions:
                 values = (
                     pos.ticket,
                     pos.type,
@@ -4796,6 +5347,8 @@ Health Score: {self.trading_system.portfolio_health:.1f}%
             self.update_analytics_display()
             self.update_status_labels()
             self.update_log_display()
+            self.update_account_display()
+            self.update_account_info_display()
             
         except Exception as e:
             print(f"GUI update error: {str(e)}")
