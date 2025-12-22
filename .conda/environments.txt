@@ -1,0 +1,3 @@
+
+/Users/isnooker/miniforge3/envs/aitrade
+/Users/isnooker/miniforge3

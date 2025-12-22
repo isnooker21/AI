@@ -1,0 +1,10 @@
+{
+  "host": "dotnet.projectSystem",
+  "entryPoint": {
+    "assemblyPath": "Microsoft.WebTools.ProjectSystem.VSCode.dll",
+    "fullClassName": "Microsoft.WebTools.ProjectSystem.VSCode.VisualDiagnostics.CssVisualDiagnosticsFactory"
+  },
+  "friendServices": [
+    "Microsoft.VisualStudio.ProjectSystem.CompositionService"
+  ]
+}

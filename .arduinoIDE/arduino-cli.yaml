@@ -1,0 +1,9 @@
+board_manager:
+    additional_urls:
+        - http://arduino.esp8266.com/stable/package_esp8266com_index.json
+directories:
+    builtin:
+        libraries: /Users/isnooker/Library/Arduino15/libraries
+    data: /Users/isnooker/Library/Arduino15
+    user: /Users/isnooker/Documents/Arduino
+locale: en
